@@ -13,11 +13,14 @@ import interactionRoutes from './routes/interaction.routes';
 import activityRoutes from './routes/activity.routes';
 import marketingRoutes from './routes/marketing.routes';
 import qaRoutes from './routes/qa.routes';
+
 dotenv.config();
 
 const app = express();
 app.use(cors());
 app.use(express.json());
+
+// Rutas de la API
 app.use('/api/auth', authRoutes);
 app.use('/api/users', userRoutes);
 app.use('/api/products', productRoutes);
@@ -29,6 +32,7 @@ app.use('/api/interactions', interactionRoutes);
 app.use('/api/activity', activityRoutes);
 app.use('/api/marketing', marketingRoutes);
 app.use('/api/qa', qaRoutes);
+
 const PORT = process.env.PORT || 3000;
 
 // Ruta de prueba general
