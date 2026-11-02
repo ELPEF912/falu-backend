@@ -19,12 +19,12 @@ dotenv.config();
 const app = express();
 app.use(cors());
 
-// Aumentamos el límite a 50MB para que las publicaciones con fotos no sean rechazadas
+// Límite de 50MB para soportar fotos y videos en productos y reseñas
 app.use(express.json({ limit: '50mb' }));
 app.use(express.urlencoded({ limit: '50mb', extended: true }));
 
-// Crear tabla persistente de catálogo en Neon PostgreSQL si no existe
-const inicializarTablaProductosCloud = async () => {
+// Inicializar tablas persistentes en Neon PostgreSQL
+const inicializarTablasCloud = async () => {
   try {
     await pool.query(`
       CREATE TABLE IF NOT EXISTS falu_productos_cloud (
@@ -52,17 +52,167 @@ const inicializarTablaProductosCloud = async () => {
         creado_en TIMESTAMP DEFAULT NOW()
       );
     `);
-    console.log('🟢 Tabla falu_productos_cloud verificada en Neon PostgreSQL.');
+
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS falu_cloud_store (
+        clave VARCHAR(120) PRIMARY KEY,
+        datos JSONB NOT NULL DEFAULT '[]'::jsonb,
+        actualizado_en TIMESTAMP DEFAULT NOW()
+      );
+    `);
+
+    console.log('🟢 Tablas falu_productos_cloud y falu_cloud_store listas en Neon.');
   } catch (err) {
-    console.error('🔴 Error al inicializar tabla falu_productos_cloud:', err);
+    console.error('🔴 Error al inicializar tablas cloud:', err);
   }
 };
 
 // ============================================================================
-// ENDPOINTS DE PRODUCTOS CONECTADOS A NEON POSTGRESQL (COMPARTIDOS ENTRE TODOS)
+// MOTOR DE SINCRONIZACIÓN EN TIEMPO REAL (PREGUNTAS, RESEÑAS, CHATS, STOCK, ETC.)
 // ============================================================================
 
-// 1. Obtener todos los productos publicados
+app.get('/api/sync', async (_req, res) => {
+  try {
+    const storeResult = await pool.query('SELECT clave, datos FROM falu_cloud_store');
+    const store: Record<string, any> = {};
+
+    for (const row of storeResult.rows) {
+      store[row.clave] = row.datos;
+    }
+
+    // Sincronizar catálogo de productos desde la tabla dedicada
+    const prodResult = await pool.query(
+      'SELECT * FROM falu_productos_cloud ORDER BY creado_en DESC'
+    );
+    const productosCloud = prodResult.rows.map((r) => ({
+      ...r,
+      id_producto: Number(r.id_producto),
+      id_vendedor: r.id_vendedor ? Number(r.id_vendedor) : 1,
+      precio: Number(r.precio),
+      precio_oferta: r.precio_oferta ? Number(r.precio_oferta) : null,
+      stock: Number(r.stock),
+      calificacion_promedio: r.calificacion_promedio
+        ? Number(r.calificacion_promedio)
+        : null,
+      total_opiniones: Number(r.total_opiniones || 0)
+    }));
+
+    if (productosCloud.length > 0) {
+      store['falu_productos_locales'] = productosCloud;
+    }
+
+    res.json({ ok: true, store });
+  } catch (error) {
+    console.error('Error en GET /api/sync:', error);
+    res.status(500).json({ error: 'Error al sincronizar datos' });
+  }
+});
+
+app.post('/api/sync', async (req, res) => {
+  try {
+    const { clave, datos } = req.body;
+    if (!clave || datos === undefined) {
+      return res.status(400).json({ error: 'Falta clave o datos' });
+    }
+
+    await pool.query(
+      `INSERT INTO falu_cloud_store (clave, datos, actualizado_en)
+       VALUES ($1, $2, NOW())
+       ON CONFLICT (clave) DO UPDATE SET
+         datos = EXCLUDED.datos,
+         actualizado_en = NOW()`,
+      [clave, JSON.stringify(datos)]
+    );
+
+    // Si se actualizó la lista de productos (ej. compra que baja stock, edición, reporte o pausa),
+    // actualizamos también la tabla falu_productos_cloud para mantener todo unificado
+    if (clave === 'falu_productos_locales' && Array.isArray(datos)) {
+      const idsPresentes: number[] = [];
+
+      for (const p of datos) {
+        const idProd = Number(p.id_producto);
+        if (!idProd) continue;
+        idsPresentes.push(idProd);
+
+        const imagenesArray = Array.isArray(p.imagenes)
+          ? p.imagenes
+          : p.imagen_url
+          ? [p.imagen_url]
+          : [];
+
+        await pool.query(
+          `INSERT INTO falu_productos_cloud (
+            id_producto, id_vendedor, vendedor_nombre, estado, motivo_baja,
+            tipo_publicacion, titulo, descripcion, precio, precio_oferta,
+            stock, categoria, imagen_url, imagenes, caracteristicas,
+            calificacion_promedio, total_opiniones, reportes_producto,
+            estado_revision_reporte, admin_encargado_reporte, resolucion_reporte
+          ) VALUES (
+            $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21
+          )
+          ON CONFLICT (id_producto) DO UPDATE SET
+            estado = EXCLUDED.estado,
+            motivo_baja = EXCLUDED.motivo_baja,
+            titulo = EXCLUDED.titulo,
+            descripcion = EXCLUDED.descripcion,
+            precio = EXCLUDED.precio,
+            precio_oferta = EXCLUDED.precio_oferta,
+            stock = EXCLUDED.stock,
+            categoria = EXCLUDED.categoria,
+            imagen_url = EXCLUDED.imagen_url,
+            imagenes = EXCLUDED.imagenes,
+            caracteristicas = EXCLUDED.caracteristicas,
+            calificacion_promedio = EXCLUDED.calificacion_promedio,
+            total_opiniones = EXCLUDED.total_opiniones,
+            reportes_producto = EXCLUDED.reportes_producto,
+            estado_revision_reporte = EXCLUDED.estado_revision_reporte,
+            admin_encargado_reporte = EXCLUDED.admin_encargado_reporte,
+            resolucion_reporte = EXCLUDED.resolucion_reporte`,
+          [
+            idProd,
+            Number(p.id_vendedor || 1),
+            p.vendedor_nombre || 'Vendedor Falú',
+            p.estado || 'activo',
+            p.motivo_baja ?? null,
+            p.tipo_publicacion || 'producto',
+            p.titulo || 'Producto',
+            p.descripcion || '',
+            Number(p.precio || 0),
+            p.precio_oferta ? Number(p.precio_oferta) : null,
+            Number(p.stock ?? 0),
+            p.categoria || 'Tecnología',
+            imagenesArray[0] || p.imagen_url || null,
+            JSON.stringify(imagenesArray),
+            JSON.stringify(p.caracteristicas || {}),
+            p.calificacion_promedio ?? null,
+            Number(p.total_opiniones || 0),
+            JSON.stringify(p.reportes_producto || []),
+            p.estado_revision_reporte || 'no_revisado',
+            p.admin_encargado_reporte ?? null,
+            p.resolucion_reporte ?? null
+          ]
+        );
+      }
+
+      if (idsPresentes.length > 0) {
+        await pool.query(
+          'DELETE FROM falu_productos_cloud WHERE NOT (id_producto = ANY($1::bigint[]))',
+          [idsPresentes]
+        );
+      }
+    }
+
+    res.json({ ok: true });
+  } catch (error) {
+    console.error('Error en POST /api/sync:', error);
+    res.status(500).json({ error: 'Error al guardar sincronización' });
+  }
+});
+
+// ============================================================================
+// ENDPOINTS REST DE PRODUCTOS
+// ============================================================================
+
 app.get('/api/products', async (_req, res) => {
   try {
     const result = await pool.query(
@@ -83,11 +233,10 @@ app.get('/api/products', async (_req, res) => {
     res.json(productos);
   } catch (error) {
     console.error('Error en GET /api/products:', error);
-    res.status(500).json({ error: 'Error al obtener productos de la base de datos' });
+    res.status(500).json({ error: 'Error al obtener productos' });
   }
 });
 
-// 2. Obtener un producto puntual por ID
 app.get('/api/products/:id', async (req, res) => {
   try {
     const result = await pool.query(
@@ -111,12 +260,10 @@ app.get('/api/products/:id', async (req, res) => {
       total_opiniones: Number(r.total_opiniones || 0)
     });
   } catch (error) {
-    console.error('Error en GET /api/products/:id:', error);
     res.status(500).json({ error: 'Error al obtener el producto' });
   }
 });
 
-// 3. Crear un nuevo producto en Neon PostgreSQL
 app.post('/api/products', async (req, res) => {
   try {
     const p = req.body;
@@ -163,12 +310,10 @@ app.post('/api/products', async (req, res) => {
 
     res.status(201).json(result.rows[0]);
   } catch (error) {
-    console.error('Error en POST /api/products:', error);
-    res.status(500).json({ error: 'No se pudo guardar el producto en la base de datos' });
+    res.status(500).json({ error: 'No se pudo guardar el producto' });
   }
 });
 
-// 4. Actualizar un producto existente (Stock, Edición, Pausa, Baja Admin o Reportes)
 app.put('/api/products/:id', async (req, res) => {
   try {
     const p = req.body;
@@ -222,12 +367,10 @@ app.put('/api/products/:id', async (req, res) => {
 
     res.json(result.rows[0] || p);
   } catch (error) {
-    console.error('Error en PUT /api/products/:id:', error);
     res.status(500).json({ error: 'Error al actualizar el producto' });
   }
 });
 
-// 5. Eliminar un producto de la base de datos
 app.delete('/api/products/:id', async (req, res) => {
   try {
     await pool.query('DELETE FROM falu_productos_cloud WHERE id_producto = $1', [
@@ -235,12 +378,10 @@ app.delete('/api/products/:id', async (req, res) => {
     ]);
     res.json({ ok: true });
   } catch (error) {
-    console.error('Error en DELETE /api/products/:id:', error);
     res.status(500).json({ error: 'Error al eliminar el producto' });
   }
 });
 
-// Rutas restantes de la API
 app.use('/api/auth', authRoutes);
 app.use('/api/users', userRoutes);
 app.use('/api/products-legacy', productRoutes);
@@ -259,26 +400,12 @@ app.get('/api/health', (_req, res) => {
   res.json({ status: 'ok', message: '¡API de Falú Marketplace funcionando!' });
 });
 
-app.get('/api/test-db', async (_req, res) => {
-  try {
-    const result = await pool.query('SELECT NOW() as hora_actual');
-    res.json({
-      status: 'Éxito',
-      message: '¡Conectado a PostgreSQL!',
-      hora_bd: result.rows[0].hora_actual
-    });
-  } catch (error) {
-    console.error(error);
-    res.status(500).json({ error: 'Fallo la conexión a la base de datos' });
-  }
-});
-
 app.listen(PORT, async () => {
   console.log(`🚀 Servidor corriendo en http://localhost:${PORT}`);
   try {
     await pool.query('SELECT 1');
     console.log('🟢 Conexión a la base de datos PostgreSQL establecida con éxito.');
-    await inicializarTablaProductosCloud();
+    await inicializarTablasCloud();
   } catch (error) {
     console.error('🔴 Error al conectar con la base de datos:', error);
   }
