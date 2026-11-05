@@ -19,11 +19,11 @@ dotenv.config();
 const app = express();
 app.use(cors());
 
-// Límite de 50MB para soportar fotos y videos en productos y reseñas
+// Límite de 50MB para admitir fotos y videos en publicaciones y reseñas
 app.use(express.json({ limit: '50mb' }));
 app.use(express.urlencoded({ limit: '50mb', extended: true }));
 
-// Inicializar tablas persistentes en Neon PostgreSQL
+// Inicializa automáticamente las tablas cloud en Neon PostgreSQL al prender el servidor
 const inicializarTablasCloud = async () => {
   try {
     await pool.query(`
@@ -61,6 +61,11 @@ const inicializarTablasCloud = async () => {
       );
     `);
 
+    // Limpia cualquier copia duplicada de productos que haya quedado en falu_cloud_store
+    await pool.query(
+      "DELETE FROM falu_cloud_store WHERE clave = 'falu_productos_locales'"
+    );
+
     console.log('🟢 Tablas falu_productos_cloud y falu_cloud_store listas en Neon.');
   } catch (err) {
     console.error('🔴 Error al inicializar tablas cloud:', err);
@@ -68,19 +73,34 @@ const inicializarTablasCloud = async () => {
 };
 
 // ============================================================================
-// MOTOR DE SINCRONIZACIÓN EN TIEMPO REAL (PREGUNTAS, RESEÑAS, CHATS, STOCK, ETC.)
+// MOTOR DE SINCRONIZACIÓN OPTIMIZADO (BAJO CONSUMO DE RED)
 // ============================================================================
 
-app.get('/api/sync', async (_req, res) => {
+app.get('/api/sync', async (req, res) => {
   try {
-    const storeResult = await pool.query('SELECT clave, datos FROM falu_cloud_store');
+    const clavePuntual = req.query.clave as string | undefined;
+
+    // Si se pide una sola clave puntual (ej. chat), devuelve únicamente esa fila liviana
+    if (clavePuntual) {
+      const result = await pool.query(
+        'SELECT datos FROM falu_cloud_store WHERE clave = $1',
+        [clavePuntual]
+      );
+      return res.json({
+        ok: true,
+        datos: result.rows[0]?.datos ?? []
+      });
+    }
+
+    const storeResult = await pool.query(
+      "SELECT clave, datos FROM falu_cloud_store WHERE clave != 'falu_productos_locales'"
+    );
     const store: Record<string, any> = {};
 
     for (const row of storeResult.rows) {
       store[row.clave] = row.datos;
     }
 
-    // Sincronizar catálogo de productos desde la tabla dedicada
     const prodResult = await pool.query(
       'SELECT * FROM falu_productos_cloud ORDER BY creado_en DESC'
     );
@@ -115,18 +135,17 @@ app.post('/api/sync', async (req, res) => {
       return res.status(400).json({ error: 'Falta clave o datos' });
     }
 
-    await pool.query(
-      `INSERT INTO falu_cloud_store (clave, datos, actualizado_en)
-       VALUES ($1, $2, NOW())
-       ON CONFLICT (clave) DO UPDATE SET
-         datos = EXCLUDED.datos,
-         actualizado_en = NOW()`,
-      [clave, JSON.stringify(datos)]
-    );
-
-    // Si se actualizó la lista de productos (ej. compra que baja stock, edición, reporte o pausa),
-    // actualizamos también la tabla falu_productos_cloud para mantener todo unificado
-    if (clave === 'falu_productos_locales' && Array.isArray(datos)) {
+    // Los productos se guardan solo en falu_productos_cloud para no duplicar peso en la base de datos
+    if (clave !== 'falu_productos_locales') {
+      await pool.query(
+        `INSERT INTO falu_cloud_store (clave, datos, actualizado_en)
+         VALUES ($1, $2, NOW())
+         ON CONFLICT (clave) DO UPDATE SET
+           datos = EXCLUDED.datos,
+           actualizado_en = NOW()`,
+        [clave, JSON.stringify(datos)]
+      );
+    } else if (Array.isArray(datos)) {
       const idsPresentes: number[] = [];
 
       for (const p of datos) {
@@ -382,6 +401,7 @@ app.delete('/api/products/:id', async (req, res) => {
   }
 });
 
+// Rutas del sistema
 app.use('/api/auth', authRoutes);
 app.use('/api/users', userRoutes);
 app.use('/api/products-legacy', productRoutes);
@@ -398,6 +418,20 @@ const PORT = process.env.PORT || 3000;
 
 app.get('/api/health', (_req, res) => {
   res.json({ status: 'ok', message: '¡API de Falú Marketplace funcionando!' });
+});
+
+app.get('/api/test-db', async (_req, res) => {
+  try {
+    const result = await pool.query('SELECT NOW() as hora_actual');
+    res.json({
+      status: 'Éxito',
+      message: '¡Conectado a PostgreSQL!',
+      hora_bd: result.rows[0].hora_actual
+    });
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ error: 'Fallo la conexión a la base de datos' });
+  }
 });
 
 app.listen(PORT, async () => {
