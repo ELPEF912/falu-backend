@@ -72,10 +72,6 @@ const inicializarTablasCloud = async () => {
   }
 };
 
-// ============================================================================
-// MOTOR DE SINCRONIZACIÓN OPTIMIZADO (BAJO CONSUMO DE RED)
-// ============================================================================
-
 app.get('/api/sync', async (req, res) => {
   try {
     const clavePuntual = req.query.clave as string | undefined;
@@ -135,7 +131,6 @@ app.post('/api/sync', async (req, res) => {
       return res.status(400).json({ error: 'Falta clave o datos' });
     }
 
-    // Los productos se guardan solo en falu_productos_cloud para no duplicar peso en la base de datos
     if (clave !== 'falu_productos_locales') {
       await pool.query(
         `INSERT INTO falu_cloud_store (clave, datos, actualizado_en)
@@ -210,13 +205,6 @@ app.post('/api/sync', async (req, res) => {
             p.admin_encargado_reporte ?? null,
             p.resolucion_reporte ?? null
           ]
-        );
-      }
-
-      if (idsPresentes.length > 0) {
-        await pool.query(
-          'DELETE FROM falu_productos_cloud WHERE NOT (id_producto = ANY($1::bigint[]))',
-          [idsPresentes]
         );
       }
     }
